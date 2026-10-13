@@ -14,7 +14,7 @@ structural-damage-classification/
 ├── data/                 # train.csv, test.csv, sample_submission.csv, metadata.csv (tidak di-commit)
 ├── notebooks/
 │   ├── 01_eda.ipynb          # eksplorasi data
-│   ├── 02_modeling.ipynb     # OvR vs OvO vs native multiclass, hasil CV, feature importance
+│   ├── 02_modeling.ipynb     # split, preprocessing, baseline (OvR/OvO), training, tuning, evaluasi
 │   └── 03_submission.ipynb   # membuat & memvalidasi submission
 ├── scripts/
 │   ├── __init__.py
@@ -52,31 +52,51 @@ structural-damage-classification/
 
 ## Alur analisis (workflow)
 
-1. **EDA** — data bersih (tanpa missing value, tanpa `building_id` yang bocor antar train/test).
-   `age_building` punya kode 999 (tidak diketahui) pada ±2.200 baris. Kelas tidak seimbang
-   (Grade 5 ≈ 36%, Grade 1 ≈ 10%).
-2. **Feature engineering** (`BuildingFeatureEngineer`): luas & tinggi per lantai, slenderness,
-   proxy volume, umur yang di-clip + flag `age_unknown`, dan potongan kode lokasi dari `building_id`
-   (`b_vdc`, `b_ward`, `b_seq`).
-3. **Preprocessing** (`ColumnTransformer`): kolom kategorik dan kode lokasi → dtype `category`
-   (penanganan kategorik native LightGBM); kolom numerik diteruskan apa adanya (model berbasis pohon).
-4. **Model** — `Pipeline([features, prep, LGBMClassifier])`, multiclass softmax native.
-5. **Evaluasi** — `StratifiedKFold` 5-fold, probabilitas out-of-fold.
-6. **Optimasi Macro F1** — bobot per kelas dikalikan ke probabilitas sebelum `argmax`, dicari dengan
-   coordinate ascent pada probabilitas OOF (supaya tidak bocor ke data latih).
+Detail langkah ada di notebook; `scripts/` berisi versi modular yang sama untuk dijalankan ulang.
+
+1. **EDA** (`01_eda.ipynb`): ukuran data, kolom yang tidak dipakai langsung, duplikasi, missing value
+   (tabel + heatmap), outlier (IQR + boxplot), distribusi numerik & kategorik, imbalance target,
+   hubungan fitur-target, korelasi, lokasi geografis, dan perbandingan train vs test.
+2. **Split** (`02_modeling.ipynb`): holdout 80/20 stratified (+ 5-fold CV di `scripts/train.py`).
+3. **Feature engineering** (`BuildingFeatureEngineer`): luas & tinggi per lantai, slenderness, proxy volume,
+   umur di-clip + flag `age_unknown`, dan potongan kode lokasi dari `building_id` (`b_vdc`, `b_ward`, `b_seq`).
+4. **Preprocessing** (`ColumnTransformer`): kategorik dan kode lokasi jadi dtype `category` (kategori native
+   LightGBM); numerik diteruskan. Baseline linear memakai `SimpleImputer` + `StandardScaler` + `OneHotEncoder`.
+5. **Baseline & strategi multi-kelas**: Dummy, Logistic Regression One-vs-Rest dan One-vs-One, RandomForest,
+   dan LightGBM (native multiclass).
+6. **Training** model utama: `Pipeline([features, prep, LGBMClassifier])`.
+7. **Hyperparameter tuning**: `RandomizedSearchCV` (3-fold, scoring `f1_macro`) pada subset 60.000 baris.
+8. **Evaluasi** pada holdout dan CV 5-fold (probabilitas out-of-fold).
+9. **Optimasi Macro F1**: bobot per kelas dikalikan ke probabilitas sebelum `argmax`, dicari dengan
+   coordinate ascent pada probabilitas OOF (tidak mengintip label holdout).
 
 ## Hasil
 
-| Pendekatan | Macro F1 |
-|---|---|
-| Logistic Regression + One-vs-Rest (subset 60k, holdout) | 0.375 |
-| Logistic Regression + One-vs-One (subset 60k, holdout) | 0.386 |
-| LightGBM native multiclass (subset 60k, holdout) | 0.516 |
-| **LightGBM full data, 5-fold CV (argmax)** | **0.582** |
-| **LightGBM + bobot kelas (CV, OOF)** | **0.587** |
+Baseline (subset 60.000 baris latih, dievaluasi pada 20.000 baris holdout):
 
-Bobot kelas hasil tuning: Grade 1–5 = `[1.00, 1.29, 1.18, 1.09, 0.78]`.
-Skor leaderboard Kaggle belum dicek dari sini; estimasi dari CV di sekitar 0.58–0.59.
+| Model | Accuracy | Macro F1 |
+|---|---|---|
+| Dummy (kelas mayoritas) | 0.362 | 0.106 |
+| Logistic Regression + One-vs-Rest | 0.540 | 0.475 |
+| Logistic Regression + One-vs-One | 0.541 | 0.480 |
+| RandomForest | 0.546 | 0.476 |
+| LightGBM (pipeline akhir, 200 pohon) | 0.573 | 0.532 |
+
+Model utama (data penuh):
+
+| Evaluasi | Macro F1 |
+|---|---|
+| Holdout 20%, parameter default | 0.579 |
+| Holdout 20%, hasil tuning | 0.576 (tidak lebih baik, default dipertahankan) |
+| Holdout 20%, default + bobot kelas | 0.584 |
+| **CV 5-fold, argmax** | **0.582** |
+| **CV 5-fold, + bobot kelas (dipakai untuk submission)** | **0.587** |
+
+Bobot kelas hasil tuning: Grade 1-5 = `[1.00, 1.29, 1.18, 1.09, 0.78]`.
+Skor leaderboard Kaggle belum dicek dari sini; estimasi dari CV di sekitar 0.58-0.59.
+
+Catatan tuning: pencarian pada subset kecil memilih pohon yang lebih kecil (`num_leaves=31`) dan hasilnya sedikit
+lebih rendah di holdout data penuh, jadi parameter default dipertahankan.
 
 ## Interpretasi
 
@@ -92,8 +112,9 @@ Skor leaderboard Kaggle belum dicek dari sini; estimasi dari CV di sekitar 0.58�
   dan sebagian ditentukan penilaian surveyor.
 - **Pembobotan kelas** menaikkan Macro F1 sekitar +0.005 karena menaikkan recall kelas minoritas (Grade 2–3)
   dengan sedikit mengorbankan Grade 5.
-- **Multi-kelas: OvR vs OvO vs native.** Pada model linear, OvO sedikit lebih baik dari OvR, tapi keduanya
-  jauh di bawah gradient boosting yang menangani multi-kelas secara native dan menangkap interaksi non-linear
-  (material × lokasi × tinggi).
+- **Multi-kelas: OvR vs OvO vs native.** Pada Logistic Regression, OvO sedikit lebih baik dari OvR (0.480 vs 0.475),
+  selisihnya kecil. LightGBM dengan multi-kelas native paling tinggi (0.532 pada subset yang sama). Sebagian
+  keunggulannya berasal dari kode lokasi halus yang tidak dipakai baseline, jadi perbandingannya bukan murni
+  algoritma vs algoritma.
 - **Catatan:** fitur `b_ward`/`b_seq` diturunkan dari `building_id`. Ini sah secara data kompetisi, tetapi
   memanfaatkan struktur penomoran survei, sehingga kurang bisa digeneralisasi ke gempa/survei lain.
